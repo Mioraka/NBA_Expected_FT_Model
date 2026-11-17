@@ -1,0 +1,60 @@
+name: Award-only model
+on:
+  push:
+    branches: [model/award-only-shot-types]
+    paths: ['scripts/fit_award_only.py', 'tests/test_award_only.py', '.github/workflows/award-only.yml']
+  pull_request:
+    paths: ['scripts/fit_award_only.py', 'tests/test_award_only.py', '.github/workflows/award-only.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      OPENBLAS_NUM_THREADS: '1'
+      OMP_NUM_THREADS: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install analysis dependencies
+        run: python -m pip install 'numpy>=1.26,<3' 'pandas>=2.2,<4' 'scipy>=1.13,<2' 'scikit-learn>=1.5,<2' 'pyarrow>=16' 'openpyxl>=3.1'
+      - name: Compile and test
+        run: |
+          python -m py_compile scripts/fit_award_only.py
+          python -m unittest discover -s tests -p test_award_only.py -v
+      - name: Inspect analysis prerequisites
+        id: inputs
+        shell: bash
+        run: |
+          if [ -f data/processed/player_shooting_zone_model_table.csv ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "Corrected broad-zone table is absent; no legacy-data fallback or fabricated experiment." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Fit primary and previous-award sensitivity
+        if: steps.inputs.outputs.ready == 'true'
+        run: |
+          python scripts/fit_award_only.py --output reports/award_only_current
+          python scripts/fit_award_only.py --award-timing previous --output reports/award_only_previous
+      - name: Test shot-type ablation when event source exists
+        if: steps.inputs.outputs.ready == 'true'
+        shell: bash
+        run: |
+          if [ -f data/raw/datanba.parquet ]; then
+            python scripts/fit_award_only.py --events data/raw/datanba.parquet --output reports/award_shot_types
+          else
+            echo "Raw datanba.parquet absent; shot-type ablation not run." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: steps.inputs.outputs.ready == 'true'
+        with:
+          name: award-only-model-results
+          path: |
+            reports/award_only_current
+            reports/award_only_previous
+            reports/award_shot_types
