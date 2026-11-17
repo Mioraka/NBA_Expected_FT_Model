@@ -136,6 +136,57 @@ def shot_features(path, d):
               "hook", "jumper", "unknown", "other"], fill_value=0)
     return shares.drop(columns="other").add_prefix("shot_type_")
 
+
+def reporting_totals(predictions, detail, path=None):
+    """Join existing other-FTA totals for reporting only; never derive by subtraction."""
+    out = predictions.copy()
+    out["other_FTA"] = np.nan
+    out["games_played"] = np.nan
+    if path is None:
+        for candidate in ["data/processed/player_season_stats_table.csv",
+                          "data/raw/NBA_FT_Dist_Player.xlsx"]:
+            if Path(candidate).is_file():
+                path = candidate
+                break
+    if path:
+        raw = pd.read_excel(path) if str(path).endswith(".xlsx") else read_table(path)
+        other = next((c for c in ["FTA_Other", "other_FTA"] if c in raw), None)
+        gp = next((c for c in ["games_played", "GP"] if c in raw), None)
+        if not other or not gp:
+            raise ValueError("Reporting source requires FTA_Other and games_played/GP")
+        raw = raw.copy()
+        if "Type" not in raw:
+            raw["Type"] = "RS"  # Legacy season totals contain regular season only.
+        if "Season Code" not in raw:
+            year = next((c for c in ["SEASON_YEAR", "season"] if c in raw), None)
+            if not year: raise ValueError("Reporting source needs explicit season year")
+            raw["Season Code"] = pd.to_numeric(raw[year], errors="raise") - 1
+        if "player_key" not in raw:
+            idcol = next((c for c in ["Player ID", "player_id"] if c in raw), None)
+            if not idcol: raise ValueError("Reporting source needs player ID or player_key")
+            ids = detail[["Player ID", "player_key"]].drop_duplicates()
+            if ids["Player ID"].duplicated().any(): raise ValueError("Ambiguous reporting ID")
+            raw = raw.merge(ids, left_on=idcol, right_on="Player ID", how="left",
+                            validate="many_to_one")
+        raw = raw.rename(columns={other: "_other", gp: "_gp"})
+        if raw.duplicated(KEY).any(): raise ValueError("Duplicate reporting totals")
+        for c in ["_other", "_gp"]:
+            raw[c] = pd.to_numeric(raw[c], errors="raise")
+        if (raw._other.dropna() < 0).any() or (raw._gp.dropna() <= 0).any():
+            raise ValueError("Invalid reporting count")
+        out = out.drop(columns=["other_FTA", "games_played"]).merge(
+            raw[KEY+["_other", "_gp"]], on=KEY, how="left", validate="one_to_one"
+        ).rename(columns={"_other": "other_FTA", "_gp": "games_played"})
+    out["other_FTA_per_game"] = out.other_FTA / out.games_played
+    out["actual_shooting_FTA_per_game"] = out.target / out.games_played
+    for model in ["shot_baseline", "award_only", "award_plus_shot_types"]:
+        if model in out:
+            out[model+"_per_game"] = out[model] / out.games_played
+            out["actual_to_"+model+"_ratio"] = out.target / out[model].replace(0, np.nan)
+    out["other_FTA_status"] = np.where(out.other_FTA.notna() & out.games_played.notna(),
+                                     "source_joined", "missing_source_totals")
+    return out
+
 def run(args):
     d = read_table(args.input)
     validate(d)
@@ -189,11 +240,13 @@ def run(args):
                 scores.append(dict(Type=typ,group=group,model=name,n=len(q),
                     MAE=e.abs().mean(),RMSE=np.sqrt((e**2).mean()),bias=e.mean()))
     out = Path(args.output); out.mkdir(parents=True, exist_ok=True)
+    predictions = reporting_totals(predictions, d, args.reporting_totals)
     predictions.to_csv(out/"heldout_predictions.csv",index=False)
     pd.DataFrame(scores).to_csv(out/"model_comparison.csv",index=False)
     pd.DataFrame(coefficients).to_csv(out/"coefficients.csv",index=False)
     audit = dict(primary="award_only",award_timing=args.award_timing,award_flags=AWARDS,
-      scorer_features=False,FG_percent_features=False,share_location_correction=False,
+      scorer_features=False,other_FTA_features=False,other_FTA_target=False,
+      other_FTA_missing_rows=int(predictions.other_FTA_per_game.isna().sum()),FG_percent_features=False,share_location_correction=False,
       shot_type_test=bool(args.events),zero_exposure_player_seasons_excluded=len(excluded),
       folds=args.folds,target=TARGET,limitations=[
       "Current awards are retrospective; previous means immediately previous season",
@@ -206,6 +259,7 @@ def run(args):
 if __name__ == "__main__":
     p=argparse.ArgumentParser()
     p.add_argument("--input",default="data/processed/player_shooting_zone_model_table.csv")
+    p.add_argument("--reporting-totals", help="CSV/Parquet or XLSX with existing FTA_Other and games played; reporting only")
     p.add_argument("--events",help="Original datanba.parquet; required for shot-type ablation")
     p.add_argument("--award-timing",choices=["current","previous"],default="current")
     p.add_argument("--prior",type=float,default=100)
