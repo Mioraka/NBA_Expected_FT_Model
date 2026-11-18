@@ -83,6 +83,35 @@ def baseline(train, test, alpha=100):
     x["expected"] = values
     return x.groupby(KEY).expected.sum()
 
+def training_offsets(d, alpha=100):
+    """Vectorized exact player-excluded rates; same estimator as baseline()."""
+    a=d.pivot(index=KEY, columns="zone", values="FGA Total").fillna(0)
+    t=d.pivot(index=KEY, columns="zone", values="target").fillna(0)
+    context=pd.MultiIndex.from_arrays([a.index.get_level_values("Season Code"),a.index.get_level_values("Type")])
+    def totals(c):
+        return d.groupby(["Season Code","Type","zone"])[c].sum().unstack(fill_value=0).reindex(columns=a.columns,fill_value=0).reindex(context).to_numpy()
+    oa=pd.DataFrame(totals("FGA Total")-a.to_numpy(),index=a.index,columns=a.columns)
+    ot=pd.DataFrame(totals("target")-t.to_numpy(),index=a.index,columns=a.columns)
+    mask=oa.eq(0)
+    if "Unknown" in mask:mask["Unknown"]=True
+    extra=ot.where(mask,0).sum(axis=1)/oa.sum(axis=1)
+    known=~mask
+    fallback=ot.where(known,0).sum(axis=1)/oa.where(known,0).sum(axis=1)
+    result=pd.Series(0.,index=a.index)
+    for z in a:
+        if z=="Unknown":
+            result+=a[z]*extra
+            continue
+        if z in TWO:
+            j=TWO.index(z);pool=TWO[max(0,j-1):j]+TWO[j+1:j+2]
+        else:pool=THREE
+        cols=[c for c in pool if c in a]
+        prior=ot[cols].sum(axis=1)/oa[cols].sum(axis=1).replace(0,np.nan)
+        prior=prior.fillna(fallback)
+        rate=((ot[z]+alpha*prior)/(oa[z]+alpha)).where(oa[z]>0,prior)+extra
+        result+=a[z]*rate
+    return result
+
 def fit(x, y, offset):
     def objective(beta):
         eta = x @ beta
@@ -108,13 +137,13 @@ def classify(description):
     return "other"
 
 def shot_features(path, d):
-    import pyarrow.parquet as pq
+    import pyarrow.dataset as ds
     ids = d[["Player ID", "player_key"]].drop_duplicates()
     if ids["Player ID"].duplicated().any():
         raise ValueError("Ambiguous source player IDs")
     mapping = ids.set_index("Player ID").player_key
     chunks = []
-    for batch in pq.ParquetFile(path).iter_batches(batch_size=200000,
+    for batch in ds.dataset(path, format="parquet").to_batches(batch_size=200000,
                   columns=["pid", "etype", "de", "_season", "_season_type"]):
         f = batch.to_pandas()
         f = f[f.etype.isin([1, 2]) & f.pid.isin(mapping.index)].copy()
@@ -168,6 +197,8 @@ def reporting_totals(predictions, detail, path=None):
             if ids["Player ID"].duplicated().any(): raise ValueError("Ambiguous reporting ID")
             raw = raw.merge(ids, left_on=idcol, right_on="Player ID", how="left",
                             validate="many_to_one")
+        raw = raw[raw.player_key.notna()].copy()
+        raw = raw.merge(out[KEY].drop_duplicates(), on=KEY, how="inner", validate="many_to_one")
         raw = raw.rename(columns={other: "_other", gp: "_gp"})
         if raw.duplicated(KEY).any(): raise ValueError("Duplicate reporting totals")
         for c in ["_other", "_gp"]:
@@ -187,6 +218,21 @@ def reporting_totals(predictions, detail, path=None):
                                      "source_joined", "missing_source_totals")
     return out
 
+def load_shot_counts(path, d):
+    raw = pd.read_csv(path)
+    if raw.duplicated(KEY).any(): raise ValueError("Duplicate shot-type counts")
+    columns = ["shot_type_"+c for c in ["dunk","driving_non_dunk","other_layup","hook","jumper","unknown","other"]]
+    if not set(columns+["FGA Total"]).issubset(raw): raise ValueError("Missing shot count columns")
+    raw = raw.set_index(KEY)
+    expected = d.groupby(KEY)["FGA Total"].sum()
+    raw = raw.reindex(expected.index)
+    values = raw[columns]
+    if values.isna().any().any() or (values<0).any().any() or (values%1!=0).any().any():
+        raise ValueError("Invalid or missing shot counts")
+    if not np.array_equal(values.sum(axis=1),expected) or not np.array_equal(raw["FGA Total"],expected):
+        raise ValueError("Shot counts do not reconcile with model FGA")
+    return values.div(expected.replace(0,np.nan),axis=0).fillna(0).drop(columns="shot_type_other")
+
 def run(args):
     d = read_table(args.input)
     validate(d)
@@ -195,7 +241,7 @@ def run(args):
     excluded = exposure[exposure == 0].index
     d = d.set_index(KEY).drop(index=excluded).reset_index()
     features = award_features(d, args.award_timing)
-    shots = shot_features(args.events, d) if args.events else None
+    shots = load_shot_counts(args.shot_type_counts, d) if args.shot_type_counts else (shot_features(args.events, d) if args.events else None)
     meta = d.groupby(KEY).agg(target=("target", "sum"))
     if "Player" in d: meta["Player"] = d.groupby(KEY).Player.first()
     for a in AWARDS: meta[args.award_timing+"_"+a] = features[args.award_timing+"_"+a]
@@ -212,10 +258,7 @@ def run(args):
         result["fold"] = fold
         result["shot_baseline"] = baseline(cal, held, args.prior).reindex(test.index)
         # Every training offset excludes the focal player's entire history.
-        offsets = []
-        for player, g in cal.groupby("player_key"):
-            offsets.append(baseline(cal[cal.player_key != player], g, args.prior))
-        offset = pd.concat(offsets).reindex(train.index)
+        offset = training_offsets(cal, args.prior).reindex(train.index)
         for name, x in models.items():
             if x.isna().any().any(): raise ValueError("Missing feature values")
             for typ in ["RS", "PO"]:
@@ -241,13 +284,22 @@ def run(args):
                     MAE=e.abs().mean(),RMSE=np.sqrt((e**2).mean()),bias=e.mean()))
     out = Path(args.output); out.mkdir(parents=True, exist_ok=True)
     predictions = reporting_totals(predictions, d, args.reporting_totals)
+    for score in scores:
+        q = predictions[predictions.Type == score["Type"]]
+        if score["group"] == "Any current/prior award":
+            q = q[q[[args.award_timing+"_"+a for a in AWARDS]].max(axis=1)==1]
+        elif score["group"] in AWARDS:
+            q = q[q[args.award_timing+"_"+score["group"]]==1]
+        q = q[q.games_played.notna()]
+        score["per_game_n"] = len(q)
+        score["MAE_per_game"] = ((q[score["model"]]-q.target)/q.games_played).abs().mean()
     predictions.to_csv(out/"heldout_predictions.csv",index=False)
     pd.DataFrame(scores).to_csv(out/"model_comparison.csv",index=False)
     pd.DataFrame(coefficients).to_csv(out/"coefficients.csv",index=False)
     audit = dict(primary="award_only",award_timing=args.award_timing,award_flags=AWARDS,
       scorer_features=False,other_FTA_features=False,other_FTA_target=False,
       other_FTA_missing_rows=int(predictions.other_FTA_per_game.isna().sum()),FG_percent_features=False,share_location_correction=False,
-      shot_type_test=bool(args.events),zero_exposure_player_seasons_excluded=len(excluded),
+      shot_type_test=bool(args.events or args.shot_type_counts),zero_exposure_player_seasons_excluded=len(excluded),
       folds=args.folds,target=TARGET,limitations=[
       "Current awards are retrospective; previous means immediately previous season",
       "Shot descriptions classify recorded FGA, not all drives or fouled attempts",
@@ -259,6 +311,7 @@ def run(args):
 if __name__ == "__main__":
     p=argparse.ArgumentParser()
     p.add_argument("--input",default="data/processed/player_shooting_zone_model_table.csv")
+    p.add_argument("--shot-type-counts", help="Validated count CSV generated from original events; alternative to --events")
     p.add_argument("--reporting-totals", help="CSV/Parquet or XLSX with existing FTA_Other and games played; reporting only")
     p.add_argument("--events",help="Original datanba.parquet; required for shot-type ablation")
     p.add_argument("--award-timing",choices=["current","previous"],default="current")

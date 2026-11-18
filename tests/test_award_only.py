@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-from fit_award_only import KEY, TARGET, classify, baseline, award_features, reporting_totals, validate
+from fit_award_only import KEY, TARGET, classify, baseline, award_features, reporting_totals, validate, training_offsets
 
 class AwardOnlyTests(unittest.TestCase):
     def sample(self):
@@ -29,6 +29,11 @@ class AwardOnlyTests(unittest.TestCase):
         d=self.sample();train=d[d.player_key!="a"];test=d[d.player_key=="a"].copy()
         a=baseline(train,test);test["FGA Total"]*=2
         np.testing.assert_allclose(2*a,baseline(train,test))
+    def test_fast_training_offsets_match_explicit_exclusion(self):
+        d=self.sample();fast=training_offsets(d)
+        for player,g in d.groupby("player_key"):
+            slow=baseline(d[d.player_key!=player],g)
+            np.testing.assert_allclose(fast.reindex(slow.index),slow)
     def test_legacy_bins_rejected(self):
         d=self.sample();d.loc[0,"zone"]="20 to <21"
         with self.assertRaises(ValueError):validate(d)

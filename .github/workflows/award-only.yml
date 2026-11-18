@@ -26,6 +26,10 @@ jobs:
         run: |
           python -m py_compile scripts/fit_award_only.py
           python -m unittest discover -s tests -p test_award_only.py -v
+      - name: Unpack restored corrected input
+        run: |
+          gzip -dkf data/processed/player_shooting_zone_model_table.csv.gz
+          gzip -dkf data/processed/shot_type_counts.csv.gz
       - name: Inspect analysis prerequisites
         id: inputs
         shell: bash
@@ -45,11 +49,7 @@ jobs:
         if: steps.inputs.outputs.ready == 'true'
         shell: bash
         run: |
-          if [ -f data/raw/datanba.parquet ]; then
-            python scripts/fit_award_only.py --events data/raw/datanba.parquet --output reports/award_shot_types
-          else
-            echo "Raw datanba.parquet absent; shot-type ablation not run." >> "$GITHUB_STEP_SUMMARY"
-          fi
+          python scripts/fit_award_only.py --shot-type-counts data/processed/shot_type_counts.csv --output reports/award_shot_types
       - uses: actions/upload-artifact@v4
         if: steps.inputs.outputs.ready == 'true'
         with:
