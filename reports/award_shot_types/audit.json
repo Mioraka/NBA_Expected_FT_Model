@@ -1,0 +1,32 @@
+{
+  "primary": "award_only",
+  "award_timing": "current",
+  "award_flags": [
+    "MVP",
+    "ALL_NBA",
+    "ALL_STAR"
+  ],
+  "scorer_features": false,
+  "other_FTA_features": false,
+  "other_FTA_target": false,
+  "other_FTA_missing_rows": 1906,
+  "FG_percent_features": false,
+  "share_location_correction": false,
+  "shot_type_test": true,
+  "zero_exposure_player_seasons_excluded": 2,
+  "folds": 5,
+  "target": [
+    "FTA Normal 2PT",
+    "FTA Normal 3PT",
+    "FTA Normal Unknown",
+    "FTA +1 2PT",
+    "FTA +1 3PT",
+    "FTA +1 Unknown"
+  ],
+  "limitations": [
+    "Current awards are retrospective; previous means immediately previous season",
+    "Shot descriptions classify recorded FGA, not all drives or fouled attempts",
+    "Source coordinate and game-attribution limitations remain",
+    "Exploratory ablation; no independent final test set"
+  ]
+}
